@@ -257,7 +257,8 @@ class CIRPState(object):
     def __init__(self,
                  input: dict,
                  device: str,
-                 fname: str = None):
+                 fname: str = None,
+                 low_battery_threshold: float = 0.3):
             # 确保 episode_step 在最开始就初始化
         self.episode_step = 0
         self.fname = fname
@@ -386,7 +387,7 @@ class CIRPState(object):
         self.total_charge_energy = torch.zeros(self.batch_size, dtype=torch.float, device=device)
         self.total_travel_energy = torch.zeros(self.batch_size, dtype=torch.float, device=device)
         self.total_supply_energy = torch.zeros(self.batch_size, dtype=torch.float, device=device)
-    
+        self.low_battery_threshold = low_battery_threshold # <--- 新增：存储低电量阈值
         #-------
         # utils
         #-------
@@ -428,23 +429,23 @@ class CIRPState(object):
         #----------------------
         self.loc_visited = torch.full((self.batch_size, self.num_locs), False, dtype=torch.bool, device=device)
     
-        self.next_vehicle_id = torch.zeros(self.batch_size, dtype=torch.long, device=device) # firstly allocate 0-th vehicles
-        self.skip = torch.full((self.batch_size,), False, dtype=bool, device=device) # [batch_size]
-        self.end  = torch.full((self.batch_size,), False, dtype=bool, device=device) # [batch_size]
-#         skip: 标记是否跳过当前场景的处理
-# end: 标记场景是否已完成
-        self.current_time = torch.zeros(self.batch_size, dtype=torch.float, device=device) # [bath_size]
-        self.tour_length = torch.zeros(self.batch_size, dtype=torch.float, device=device) # [batch_size]
-#         current_time: 追踪每个场景的当前时间
-# tour_length: 记录每个场景的总路径长度
-        #self.penalty_empty_locs = torch.zeros(self.batch_size, dtype=torch.float, device=device) # [batch_size]
-        self.accumulated_conflict_cost = torch.zeros(self.batch_size, dtype=torch.float, device=device)  # 新增：累计冲突成本
-        next_vehicle_mask = torch.arange(self.num_vehicles).to(self.device).unsqueeze(0).expand(self.batch_size, -1).eq(self.next_vehicle_id.unsqueeze(-1)) # [batch_size x num_vehicles]
-        # 记录基站电量耗尽的惩罚值
-        self.mask = self.update_mask(self.vehicle_position_id[next_vehicle_mask], next_vehicle_mask)
-        # 基于车辆位置和车辆掩码更新状态掩码
-        # 控制车辆可访问的节点
-        self.charge_queue = torch.zeros((self.batch_size, self.num_depots, self.num_vehicles), dtype=torch.long, device=device)
+#         self.next_vehicle_id = torch.zeros(self.batch_size, dtype=torch.long, device=device) # firstly allocate 0-th vehicles
+#         self.skip = torch.full((self.batch_size,), False, dtype=bool, device=device) # [batch_size]
+#         self.end  = torch.full((self.batch_size,), False, dtype=bool, device=device) # [batch_size]
+# #         skip: 标记是否跳过当前场景的处理
+# # end: 标记场景是否已完成
+#         self.current_time = torch.zeros(self.batch_size, dtype=torch.float, device=device) # [bath_size]
+#         self.tour_length = torch.zeros(self.batch_size, dtype=torch.float, device=device) # [batch_size]
+# #         current_time: 追踪每个场景的当前时间
+# # tour_length: 记录每个场景的总路径长度
+#         #self.penalty_empty_locs = torch.zeros(self.batch_size, dtype=torch.float, device=device) # [batch_size]
+#         self.accumulated_conflict_cost = torch.zeros(self.batch_size, dtype=torch.float, device=device)  # 新增：累计冲突成本
+#         next_vehicle_mask = torch.arange(self.num_vehicles).to(self.device).unsqueeze(0).expand(self.batch_size, -1).eq(self.next_vehicle_id.unsqueeze(-1)) # [batch_size x num_vehicles]
+#         # 记录基站电量耗尽的惩罚值
+#         self.mask = self.update_mask(self.vehicle_position_id[next_vehicle_mask], next_vehicle_mask)
+#         # 基于车辆位置和车辆掩码更新状态掩码
+#         # 控制车辆可访问的节点
+#         self.charge_queue = torch.zeros((self.batch_size, self.num_depots, self.num_vehicles), dtype=torch.long, device=device)
 # 初始化充电站的车辆排队情况
 # shape: [batch_size × num_depots × num_vehicles]
 # next_vehicle_mask = torch.arange(self.num_vehicles)        # 创建车辆索引序列
@@ -478,6 +479,25 @@ class CIRPState(object):
 # 管理充电队列状态
 # 计算性能指标(如惩罚值)
 # 控制车辆的可访问节点
+        # --- 重要：确保在所有必要属性（包括 low_battery_threshold）都设置好之后，再首次更新 mask ---
+        # Initialize mask and other dependent states only if not already initialized (e.g., during reset)
+        if not hasattr(self, 'mask'):
+            self.next_vehicle_id = torch.zeros(self.batch_size, dtype=torch.long, device=device) # firstly allocate 0-th vehicles
+            self.skip = torch.full((self.batch_size,), False, dtype=bool, device=device) # [batch_size]
+            self.end  = torch.full((self.batch_size,), False, dtype=bool, device=device) # [batch_size]
+            self.current_time = torch.zeros(self.batch_size, dtype=torch.float, device=device) # [bath_size]
+            self.tour_length = torch.zeros(self.batch_size, dtype=torch.float, device=device) # [batch_size]
+            self.accumulated_conflict_cost = torch.zeros(self.batch_size, dtype=torch.float, device=device)
+            # 现在可以安全地调用 update_mask，因为它依赖的属性（如 low_battery_threshold）已经存在
+            next_vehicle_mask = torch.arange(self.num_vehicles, device=self.device).unsqueeze(0).expand(self.batch_size, -1).eq(self.next_vehicle_id.unsqueeze(-1))
+            # 确保 vehicle_position_id 也已初始化
+            if not hasattr(self, 'vehicle_position_id'):
+                 self.vehicle_position_id  = input["vehicle_initial_position_id"].clone()
+            # 调用 update_mask 来初始化 self.mask
+            self.mask = self.update_mask(self.vehicle_position_id.gather(-1, self.next_vehicle_id.unsqueeze(-1)).squeeze(-1), next_vehicle_mask)
+            # 初始化充电队列
+            self.charge_queue = torch.zeros((self.batch_size, self.num_depots, self.num_vehicles), dtype=torch.long, device=device)
+            
         #-------------------
         # for visualization
         #-------------------
@@ -505,12 +525,6 @@ class CIRPState(object):
                 #"supplying_vehicles_count" # 供电中的车辆数量
                 "accumulated_conflict_cost",  # 新增：累计冲突成本
             ]
-            
-            # 初始化动作历史记录字典
-            self.action_histories = {
-                action_name: [[] for _ in range(self.batch_size)] 
-                for action_name in self.action_names
-            }
             
             
             # 保存上一步的动作信息的临时存储
@@ -554,11 +568,6 @@ class CIRPState(object):
                 "end"              # 结束标记
             ]
             
-            # 初始化掩码历史记录字典
-            self.mask_histories = {
-                mask_name: [[] for _ in range(self.batch_size)] 
-                for mask_name in self.mask_names
-            }
             #             # 假设 batch_size = 2，系统运行过程中的某个时刻：
             # self.mask_histories = {
             #     "loc_is_down": [
@@ -579,24 +588,21 @@ class CIRPState(object):
                 "vehicle_unavail_time",  # 车辆不可用时间
                 "charging_vehicles"      # 哪些车辆正在充电
             ]
-            self.queue_histories = {
-                name: [[] for _ in range(self.batch_size)]
-                for name in self.queue_related_names
-            }
-            # 初始化掩码计算日志
-            self.queue_calc_log = [[] for _ in range(self.batch_size)]
-        
-            self.mask_calc_log = [[] for _ in range(self.batch_size)]
-            self.vehicle_batt_history = [[[] for __ in range(self.num_vehicles)] 
-                                    for _ in range(self.batch_size)]
-            # self.loc_batt_history = [[[] for __ in range(self.num_locs)] 
-            #                         for _ in range(self.batch_size)]
-            self.time_history = [[] for _ in range(self.batch_size)]
-            #self.down_history = [[] for _ in range(self.batch_size)]
-                    # 可视化初始状态
-            all_batch = torch.full((self.batch_size, ), True, device=self.device)
-            self.visualize_state_batch(all_batch)
-            self.queue_cost_log = []
+
+             # 可视化初始状态
+             # 放在 __init__ 的最后，确保所有状态都已设置
+            if not hasattr(self, 'mask_histories'): # 防止重复初始化
+                 self.action_histories = {name: [[] for _ in range(self.batch_size)] for name in self.action_names}
+                 self.mask_histories = {name: [[] for _ in range(self.batch_size)] for name in self.mask_names}
+                 self.queue_histories = {name: [[] for _ in range(self.batch_size)] for name in self.queue_related_names}
+                 self.mask_calc_log = [[] for _ in range(self.batch_size)]
+                 self.queue_calc_log = [[] for _ in range(self.batch_size)]
+                 self.vehicle_batt_history = [[[] for __ in range(self.num_vehicles)] for _ in range(self.batch_size)]
+                 self.time_history = [[] for _ in range(self.batch_size)]
+                 self.queue_cost_log = []
+                 # 调用可视化
+                 all_batch = torch.full((self.batch_size, ), True, device=self.device)
+                 self.visualize_state_batch(all_batch)
             # visualize initial state
         #----------------------
         # common dynamic state
@@ -1657,16 +1663,17 @@ class CIRPState(object):
         """
         
         batch = 0  # 之后改 看这里可不可以调整 为简化，主要记录第一个批次的详情 看看多个批次一样吗
-        current_step_log = {
-            "step": self.episode_step,
-            "time": self.current_time[batch].item(),
-            "acting_vehicle": self.next_vehicle_id[batch].item(),
-            "current_node": next_node_id[batch].item(),
-            "rule_masks": {},
-            "intermediate_results": {}
-        }
-        # 在断言前添加这段代
-
+        current_step_log = None # 初始化为 None
+        # 只有在需要记录日志时才创建字典
+        if self.fname is not None and hasattr(self, 'mask_calc_log'):
+            current_step_log = {
+                "step": self.episode_step,
+                "time": self.current_time[batch].item(),
+                "acting_vehicle": self.next_vehicle_id[batch].item(),
+                "current_node": next_node_id[batch].item(),
+                "rule_masks": {},
+                "intermediate_results": {}
+            }
         
         #创建全1矩阵，初始状态所有节点都可访问
         mask = torch.ones(self.batch_size, self.num_nodes, dtype=torch.int32, device=self.device) # [batch_size x num_nodes]
@@ -1762,6 +1769,40 @@ class CIRPState(object):
         if self.fname is not None and hasattr(self, 'mask_calc_log'):
            current_step_log["rule_masks"]["after_depot_to_depot"] = mask[batch].clone().detach().cpu()
 
+        # --- 新增规则：低电量强制去充电站 ---
+        # 获取当前决策车辆的电量和容量
+        # 使用 self.next_vehicle_id 获取当前决策车辆的索引
+        current_batt = self.vehicle_curr_battery.gather(1, self.next_vehicle_id.view(-1, 1)).squeeze(1)
+        current_cap = self.vehicle_cap.gather(1, self.next_vehicle_id.view(-1, 1)).squeeze(1)
+
+        # 计算电量阈值
+        battery_limit = self.low_battery_threshold * current_cap + SMALL_VALUE # 加一点小数防止精度问题
+
+        # 识别哪些批次的当前车辆电量低
+        is_low_battery = current_batt <= battery_limit # [batch_size]
+
+        # 如果存在低电量车辆，则应用限制
+        if is_low_battery.any():
+            # 创建一个限制掩码，其中客户点(loc)为0，充电站(depot)为1
+            loc_restriction = torch.zeros(self.batch_size, self.num_locs, dtype=mask.dtype, device=self.device)
+            depot_allowance = torch.ones(self.batch_size, self.num_depots, dtype=mask.dtype, device=self.device)
+            low_battery_restriction_mask = torch.cat((loc_restriction, depot_allowance), dim=1) # [batch_size, num_nodes]
+
+            # 创建一个条件掩码，用于选择性地应用限制
+            # 形状: [batch_size, 1] -> [batch_size, num_nodes]
+            apply_restriction_condition = is_low_battery.unsqueeze(1).expand_as(mask)
+
+            # 使用 torch.where 应用限制：如果电量低，则使用限制掩码，否则保持原样
+            # 注意：这里直接使用 low_battery_restriction_mask 会屏蔽掉所有 loc，这是我们想要的
+            mask = torch.where(apply_restriction_condition, low_battery_restriction_mask, mask)
+
+            # （可选）记录日志
+            if current_step_log is not None:
+                current_step_log["intermediate_results"]["low_battery_triggered"] = is_low_battery[batch].item()
+                current_step_log["intermediate_results"]["low_battery_limit"] = battery_limit[batch].item()
+                current_step_log["intermediate_results"]["current_acting_battery"] = current_batt[batch].item()
+                current_step_log["rule_masks"]["after_low_battery"] = mask[batch].clone().detach().cpu()
+        # --- 新增规则结束 ---
 
         # --------------------------------------------------------------------------
         # 新规则: 如果当前车辆在客户点(loc)，则屏蔽被 *其他* 车辆占用的充电站(depot)
@@ -1841,57 +1882,145 @@ class CIRPState(object):
 # 确保充电效率
 # 这个之后改就没了 一次所有站点都符合条件
 # 相对于注释掉 不如 直接改成符合所有条件
-        # Only add to mask_calc_log if it exists
-        if self.fname is not None and hasattr(self, 'mask_calc_log'):
+        # 规则: 跳过的批次仅允许留在原地
+        current_node_mask = self.node_arange_idx.eq(next_node_id.unsqueeze(1)).int()
+        mask[self.skip] = current_node_mask[self.skip]
+        if current_step_log is not None:
             current_step_log["intermediate_results"]["is_skipped"] = self.skip[batch].item()
-        
-        self.mask_skipped_episodes(mask, next_node_id)
-        # 在这里添加新代码 (在保存最终掩码之前)
-        if mask.sum(-1).min() == 0:  # If any vehicle has no valid nodes
-            empty_mask_indices = torch.where(mask.sum(-1) == 0)[0]
-            for idx in empty_mask_indices:
-                current_node = next_node_id[idx]
-                mask[idx, current_node] = 1
-
-        # Only add to mask_calc_log if it exists
-        if self.fname is not None and hasattr(self, 'mask_calc_log'):
             current_step_log["rule_masks"]["after_skipped"] = mask[batch].clone().detach().cpu()
-            
-            # 保存最终掩码和完整日志
+
+
+        # =========================================================================
+        # --- 开始修改/替换的部分：最终检查和智能回退逻辑 ---
+        # =========================================================================
+
+        # 检查哪些批次的车辆在应用所有规则后没有有效节点 (且未被跳过)
+        no_valid_nodes = (mask.sum(dim=1) == 0) & (~self.skip)
+
+        if no_valid_nodes.any():
+            # 获取没有有效节点的批次索引
+            problematic_batch_indices = torch.where(no_valid_nodes)[0]
+
+            # 针对每个有问题的批次进行处理
+            for batch_idx in problematic_batch_indices:
+                # 获取搁浅车辆的信息
+                stranded_vehicle_id = self.next_vehicle_id[batch_idx].item() # 当前决策车辆的ID
+                current_node_id = next_node_id[batch_idx] # 车辆当前节点ID (Tensor)
+                # 获取当前车辆坐标，确保形状正确 [coord_dim]
+                current_coords = self.coords[batch_idx, current_node_id]
+
+                # 1. 识别可用的充电站 (在此回退逻辑中，我们不考虑 small_depots)
+                depot_ids_global = torch.arange(self.num_locs, self.num_nodes, device=self.device) # 所有充电站的全局ID
+
+                # 找出被其他车辆占用的充电站
+                all_positions = self.vehicle_position_id[batch_idx] # 当前批次所有车辆的位置 [num_vehicles]
+                other_vehicle_mask = torch.arange(self.num_vehicles, device=self.device) != stranded_vehicle_id
+                other_positions = all_positions[other_vehicle_mask]
+                occupied_depots_global_ids = other_positions[other_positions >= self.num_locs] # 被其他车占用的充电站全局ID
+
+                # 创建可用充电站掩码 (使用全局 ID)
+                available_depot_mask_global = torch.ones(self.num_nodes, dtype=torch.bool, device=self.device)
+                available_depot_mask_global[:self.num_locs] = False # 先屏蔽所有 loc
+                if occupied_depots_global_ids.numel() > 0:
+                    available_depot_mask_global[occupied_depots_global_ids] = False # 屏蔽被占用的 depot
+
+                # 获取可用的充电站的全局ID和坐标
+                available_depot_global_ids = torch.where(available_depot_mask_global)[0]
+
+                if available_depot_global_ids.numel() > 0:
+                    # 存在可用的充电站
+                    # 获取可用充电站的坐标 [num_available, coord_dim]
+                    available_depot_coords = self.coords[batch_idx, available_depot_global_ids]
+
+                    # 2. 计算到可用充电站的距离
+                    # current_coords: [coord_dim], available_depot_coords: [num_available, coord_dim]
+                    distances = torch.linalg.norm(current_coords.unsqueeze(0) - available_depot_coords, dim=1)
+
+                    # 3. 找到最近的可用充电站
+                    closest_idx_in_available = torch.argmin(distances) # 在 available_depot_global_ids 中的索引
+                    target_depot_global_id = available_depot_global_ids[closest_idx_in_available]
+
+                    # 4. 修改掩码，只允许去这个最近的可用充电站
+                    mask[batch_idx] = 0 # 先全部置零
+                    mask[batch_idx, target_depot_global_id] = 1 # 只允许目标充电站
+
+                    # 打印引导信息
+                    print(f"信息: 步骤 {self.episode_step}, 时间 {self.current_time[batch_idx]:.3f}, "
+                          f"车辆 {stranded_vehicle_id} (节点 {current_node_id.item()}) "
+                          f"无有效目标，已引导至最近可用充电站 {target_depot_global_id.item()}")
+
+                    # (可选) 更新日志
+                    if current_step_log is not None and batch_idx == batch:
+                        log_entry = self.mask_calc_log[batch_idx][-1]
+                        log_entry["intermediate_results"]["redirected_to_depot"] = target_depot_global_id.item()
+                        log_entry["rule_masks"]["after_redirection"] = mask[batch_idx].clone().detach().cpu()
+
+
+                else:
+                    # 没有可用的充电站，执行原始的回退逻辑：允许停留在原地
+                    print(f"警告: 步骤 {self.episode_step}, 时间 {self.current_time[batch_idx]:.3f}, "
+                          f"车辆 {stranded_vehicle_id} (节点 {current_node_id.item()}) "
+                          f"没有有效目标节点，且无可用充电站，将允许留在原地。")
+                    mask[batch_idx] = 0 # 先全部置零
+                    mask[batch_idx, current_node_id] = 1 # 允许留在原地
+
+                    # (可选) 更新日志
+                    if current_step_log is not None and batch_idx == batch:
+                         if self.mask_calc_log[batch_idx]:
+                            log_entry = self.mask_calc_log[batch_idx][-1]
+                            log_entry["intermediate_results"]["fallback_stay_put_applied"] = True
+                            log_entry["rule_masks"]["after_fallback"] = mask[batch_idx].clone().detach().cpu()
+
+        # =========================================================================
+        # --- 结束修改/替换的部分 ---
+        # =========================================================================
+
+        # （可选）保存最终日志条目
+        if current_step_log is not None:
             current_step_log["final_mask"] = mask[batch].clone().detach().cpu()
-            
-            # Only append to mask_calc_log if it exists
+            # 确保 self.mask_calc_log[batch] 是列表
+            if isinstance(self.mask_calc_log[batch], list):
+                 self.mask_calc_log[batch].append(current_step_log)
+            else:
+                 print(f"错误：self.mask_calc_log[{batch}] 不是列表！")
+                 
+        # --- 最终检查和回退 ---
+        # 如果应用规则后，某个批次没有任何可选节点，则允许其停留在当前节点作为回退
+        no_valid_nodes = (mask.sum(dim=1) == 0) & (~self.skip) # 检查非跳过批次
+        if no_valid_nodes.any():
+            print(f"警告: 在步骤 {self.episode_step}, 时间 {self.current_time[no_valid_nodes].tolist()}, "
+                  f"车辆 {self.next_vehicle_id[no_valid_nodes].tolist()} "
+                  f"(位于节点 {next_node_id[no_valid_nodes].tolist()}) 没有有效目标节点，将允许留在原地。")
+            # 仅对没有有效节点的批次，允许停留在当前节点
+            mask[no_valid_nodes] = current_node_mask[no_valid_nodes]
+            if current_step_log is not None and no_valid_nodes[batch]:
+                 current_step_log["intermediate_results"]["fallback_stay_put_applied"] = True
+                 current_step_log["rule_masks"]["after_fallback"] = mask[batch].clone().detach().cpu()
+
+
+        # 保存最终日志条目
+        if current_step_log is not None:
+            current_step_log["final_mask"] = mask[batch].clone().detach().cpu()
             self.mask_calc_log[batch].append(current_step_log)
-        # 在这里添加新代码 (在保存最终掩码之前)
 
-        if mask.sum(-1).min() == 0:  # If any vehicle has no valid nodes
-            empty_mask_indices = torch.where(mask.sum(-1) == 0)[0]
-            for idx in empty_mask_indices:
-                current_node = next_node_id[idx]
-                mask[idx, current_node] = 1
+        # 最终断言检查
+        all_zero = mask.sum(-1) == 0
+        # if all_zero.any(): # 调试信息
+        #     problematic_batch_indices = torch.where(all_zero)[0]
+        #     print(f"错误: 在步骤 {self.episode_step}, 以下批次没有可访问节点: {problematic_batch_indices.tolist()}")
+        #     for idx in problematic_batch_indices:
+        #         print(f"  批次 {idx}: 时间={self.current_time[idx]:.3f}, "
+        #               f"车辆={self.next_vehicle_id[idx].item()}, "
+        #               f"位置={next_node_id[idx].item()}, "
+        #               f"电量={self.vehicle_curr_battery[idx, self.next_vehicle_id[idx]].item():.2f}/{self.vehicle_cap[idx, self.next_vehicle_id[idx]].item():.2f}, "
+        #               f"跳过={self.skip[idx].item()}")
+        #     # 如果需要，可以在这里抛出错误或者允许程序继续（可能导致错误）
+        #     # assert False, "关键错误：存在没有可访问节点的批次！" # 取消注释以在出错时停止
 
-        # 在这里添加调试信息 (就在断言检查之前)
-        all_zero = mask.sum(-1) == 0  # [batch_size]
-        if all_zero.any() and relaxed_mask:
-            for batch_idx in range(self.batch_size):
-                        # Find where we have no valid nodes
-                for batch_idx in torch.where(all_zero)[0]:
-                    # Allow staying at the current node as a fallback
-                    if all_zero[batch_idx]:
-                        print(f"No valid nodes for batch {batch_idx}!")
-                        print(f"Current time: {self.current_time[batch_idx]}")
-                        print(f"Vehicle battery: {self.vehicle_curr_battery[batch_idx]}")
-                        print(f"Vehicle position: {self.vehicle_position_id[batch_idx]}")
-                        print(f"Mask state: {mask[batch_idx]}")
-                        print(f"Is at depot: {self.is_depot(next_node_id[batch_idx])}")
-                        print(f"Vehicle phase: {self.vehicle_phase[batch_idx]}")
-                        print(f"Vehicle unavailable time: {self.vehicle_unavail_time[batch_idx]}")
-                        mask[batch_idx, next_node_id[batch_idx]] = 1
+        assert not all_zero.any(), "最终检查: 仍然存在没有可访问节点的批次!"
 
-        # Original assertion check
-        assert not all_zero.any(), "there is no node that the vehicle can visit!"
-        
         return mask
+
 # 假设：batch_size=2, num_nodes=5
 # # 初始掩码:
 # mask = [
