@@ -251,7 +251,7 @@ if __name__ == "__main__":
     # training settings
     #-------------------
     parser.add_argument("--batch_size",          type=int,   default=128)
-    parser.add_argument("--epochs",              type=int,   default=1) #改小一点 为1 但不能为0
+    parser.add_argument("--epochs",              type=int,   default=0) #改小一点 为1 但不能为0
     parser.add_argument("--log_interval",        type=int,   default=20)
     parser.add_argument("--checkpoint_interval", type=int,   default=1)
     parser.add_argument("--lr",                  type=float, default=1e-4)

@@ -1761,7 +1761,67 @@ class CIRPState(object):
         #Only add to mask_calc_log if it exists
         if self.fname is not None and hasattr(self, 'mask_calc_log'):
            current_step_log["rule_masks"]["after_depot_to_depot"] = mask[batch].clone().detach().cpu()
-        
+
+
+        # --------------------------------------------------------------------------
+        # 新规则: 如果当前车辆在客户点(loc)，则屏蔽被 *其他* 车辆占用的充电站(depot)
+        # (直接检查充电站占用版本)
+        # --------------------------------------------------------------------------
+        is_at_loc = (next_node_id < self.num_locs) # 形状: [batch_size]
+
+        if is_at_loc.any():
+            # --- 直接检查被其他车辆占用的充电站 ---
+            curr_vehicle_id = self.next_vehicle_id             # 当前决策车辆ID [batch_size]
+            all_positions = self.vehicle_position_id         # 所有车辆的位置 [batch_size, num_vehicles]
+            num_vehicles = self.num_vehicles
+            batch_size = self.batch_size
+            # 充电站ID范围对应的张量 [num_depots]
+            depot_ids_tensor = torch.arange(self.num_locs, self.num_nodes, device=self.device)
+
+            # 检查车辆 v 是否在充电站 d: [batch_size, num_vehicles, num_depots]
+            # (all_positions: [b, v]) -> [b, v, 1]
+            # (depot_ids_tensor: [d]) -> [1, 1, d]
+            at_depot_mask = (all_positions.unsqueeze(2) == depot_ids_tensor.view(1, 1, -1))
+
+            # 标识当前决策车辆的掩码: [batch_size, num_vehicles, 1]
+            # (torch.arange: [v]) -> [1, v, 1]
+            # (curr_vehicle_id: [b]) -> [b, 1, 1]
+            current_vehicle_indicator = (torch.arange(num_vehicles, device=self.device).view(1, -1, 1) == curr_vehicle_id.view(-1, 1, 1))
+
+            # 检查车辆 v (不是当前车辆) 是否在充电站 d: [batch_size, num_vehicles, num_depots]
+            occupied_by_others_at_depot = at_depot_mask & ~current_vehicle_indicator
+
+            # 检查充电站 d 是否被 *至少一个* 其他车辆占用: [batch_size, num_depots]
+            # 沿着车辆维度 (dim=1) 进行 'any' 操作
+            occupied_depots = occupied_by_others_at_depot.any(dim=1)
+            # --- 直接检查结束 ---
+
+            # 创建完整的节点掩码，其中只有被其他车辆占用的充电站为 True
+            occupied_depots_mask = torch.cat(
+                (torch.zeros(batch_size, self.num_locs, dtype=torch.bool, device=self.device),
+                 occupied_depots),
+                dim=1
+            ) # 形状: [batch_size, num_nodes]
+
+            # 应用掩码：只有当车辆在客户点时，才屏蔽被占用的充电站
+            mask_update_factor = ~occupied_depots_mask # True 表示允许, False 表示屏蔽
+            mask = torch.where(
+                is_at_loc.unsqueeze(1).expand(-1, self.num_nodes), # 条件扩展到 mask 的形状
+                mask * mask_update_factor,                         # 在 loc 时，应用因子
+                mask                                               # 不在 loc 时，保持不变
+            )
+
+            # 可选：为此规则添加日志记录
+            if self.fname is not None and hasattr(self, 'mask_calc_log') and is_at_loc[0]:
+                current_step_log["intermediate_results"]["rule_AtLoc_OccDepot_is_at_loc"] = is_at_loc[0].item()
+                current_step_log["intermediate_results"]["rule_AtLoc_OccDepot_occupied_depots"] = occupied_depots[0].clone().detach().cpu() # 记录直接计算的结果
+                current_step_log["rule_masks"]["after_AtLoc_OccDepot"] = mask[0].clone().detach().cpu()
+        # --------------------------------------------------------------------------
+        # 新规则结束
+        # --------------------------------------------------------------------------
+
+
+
         # mask 4: forbit vehicles to visit depots that have small discharge rate
 #         标记其他车辆正在访问的节点为不可访问
 # 避免多车同时访问同一节点
@@ -3278,54 +3338,54 @@ class CIRPState(object):
                 f.write("规则2: 屏蔽无法返回的节点 (电量/时间不足)\n")
                 f.write(f"  应用后: {format_mask(log_entry['rule_masks'].get('after_unreturnable'), self.num_locs)}\n\n")
                 
-                # 规则3: 已访问节点
-                f.write("规则3: 屏蔽已被其他车辆访问的节点\n")
+                # # 规则3: 已访问节点
+                # f.write("规则3: 屏蔽已被其他车辆访问的节点\n")
                 
-                # 显示原始车辆位置信息（包括充电站）
-                reserved_nodes = log_entry['intermediate_results'].get('reserved_nodes')
-                if reserved_nodes is not None:
-                    f.write("  原始车辆位置 (包括充电站):\n")
-                    f.write(f"  {format_mask(reserved_nodes, self.num_locs)}\n")
+                # # 显示原始车辆位置信息（包括充电站）
+                # reserved_nodes = log_entry['intermediate_results'].get('reserved_nodes')
+                # if reserved_nodes is not None:
+                #     f.write("  原始车辆位置 (包括充电站):\n")
+                #     f.write(f"  {format_mask(reserved_nodes, self.num_locs)}\n")
                 
-                # 显示重置充电站后的位置信息
-                reset_nodes = log_entry['intermediate_results'].get('reserved_nodes_after_reset')
-                if reset_nodes is not None:
-                    f.write("  重置充电站后的车辆位置:\n")
-                    f.write(f"  {format_mask(reset_nodes, self.num_locs)}\n")
+                # # 显示重置充电站后的位置信息
+                # reset_nodes = log_entry['intermediate_results'].get('reserved_nodes_after_reset')
+                # if reset_nodes is not None:
+                #     f.write("  重置充电站后的车辆位置:\n")
+                #     f.write(f"  {format_mask(reset_nodes, self.num_locs)}\n")
                 
-                # 显示规则应用前的掩码状态
-                before_mask = log_entry['rule_masks'].get('before_visited_locs')
-                if before_mask is not None:
-                    f.write("  应用规则前的掩码:\n")
-                    f.write(f"  {format_mask(before_mask, self.num_locs)}\n")
+                # # 显示规则应用前的掩码状态
+                # before_mask = log_entry['rule_masks'].get('before_visited_locs')
+                # if before_mask is not None:
+                #     f.write("  应用规则前的掩码:\n")
+                #     f.write(f"  {format_mask(before_mask, self.num_locs)}\n")
                 
-                # 显示应用规则后的结果
-                after_mask = log_entry['rule_masks'].get('after_visited_locs')
-                if after_mask is not None:
-                    f.write("  应用规则后的掩码:\n")
-                    f.write(f"  {format_mask(after_mask, self.num_locs)}\n\n")
+                # # 显示应用规则后的结果
+                # after_mask = log_entry['rule_masks'].get('after_visited_locs')
+                # if after_mask is not None:
+                #     f.write("  应用规则后的掩码:\n")
+                #     f.write(f"  {format_mask(after_mask, self.num_locs)}\n\n")
                 
                 # 新增: 规则3.5: 屏蔽已访问过的客户点
                 f.write("规则3.5: 屏蔽已访问过的客户点\n")
                 
                 # 显示已访问客户点信息
-                visited_locations = log_entry['intermediate_results'].get('visited_locations')
-                if visited_locations is not None:
-                    f.write("  已访问客户点:\n")
-                    visited_str = ", ".join([f"基站{i}:{v}" for i, v in enumerate(visited_locations.tolist())])
-                    f.write(f"  [{visited_str}]\n")
+                # visited_locations = log_entry['intermediate_results'].get('visited_locations')
+                # if visited_locations is not None:
+                #     f.write("  已访问客户点:\n")
+                #     visited_str = ", ".join([f"基站{i}:{v}" for i, v in enumerate(visited_locations.tolist())])
+                #     f.write(f"  [{visited_str}]\n")
                 
                 # 显示扩展后的掩码
                 padded_mask = log_entry['intermediate_results'].get('padded_visited_mask')
                 if padded_mask is not None:
-                    f.write("  扩展后的已访问掩码:\n")
+                    f.write("  已访问掩码:\n")
                     f.write(f"  {format_mask(padded_mask, self.num_locs)}\n")
                 
-                # 显示规则应用前的掩码
-                before_rule35_mask = log_entry['rule_masks'].get('before_rule3_5')
-                if before_rule35_mask is not None:
-                    f.write("  应用规则3.5前的掩码:\n")
-                    f.write(f"  {format_mask(before_rule35_mask, self.num_locs)}\n")
+                # # 显示规则应用前的掩码
+                # before_rule35_mask = log_entry['rule_masks'].get('before_rule3_5')
+                # if before_rule35_mask is not None:
+                #     f.write("  应用规则3.5前的掩码:\n")
+                #     f.write(f"  {format_mask(before_rule35_mask, self.num_locs)}\n")
                 
                 # 显示规则应用后的掩码
                 after_rule35_mask = log_entry['rule_masks'].get('after_rule3_5')
@@ -3338,14 +3398,45 @@ class CIRPState(object):
                 f.write(f"  当前在充电站: {log_entry['intermediate_results'].get('at_depot', False)}\n")
                 f.write(f"  应用后: {format_mask(log_entry['rule_masks'].get('after_depot_to_depot'), self.num_locs)}\n\n")
                 
-                # 规则5: 低功率充电站
-                f.write("规则5: 屏蔽低功率充电站\n")
-                small_depots = log_entry['intermediate_results'].get('small_depots')
-                if small_depots is not None:
-                    small_depots_indices = [i for i, x in enumerate(small_depots.tolist()) if x]
-                    f.write(f"  低功率站索引: {small_depots_indices}\n")
-                f.write(f"  应用后: {format_mask(log_entry['rule_masks'].get('after_small_depots'), self.num_locs)}\n\n")
-                
+                # # 规则5: 低功率充电站
+                # f.write("规则5: 屏蔽低功率充电站\n")
+                # small_depots = log_entry['intermediate_results'].get('small_depots')
+                # if small_depots is not None:
+                #     small_depots_indices = [i for i, x in enumerate(small_depots.tolist()) if x]
+                #     f.write(f"  低功率站索引: {small_depots_indices}\n")
+                # f.write(f"  应用后: {format_mask(log_entry['rule_masks'].get('after_small_depots'), self.num_locs)}\n\n")
+
+                # --- 新增: 打印新规则的计算过程 ---
+                f.write("新规则: 若当前车辆在客户点，则屏蔽被其他车辆占用的充电站\n")
+                # 检查是否有此规则的日志信息
+                is_at_loc_logged = log_entry['intermediate_results'].get('rule_AtLoc_OccDepot_is_at_loc', None)
+                occupied_depots_logged = log_entry['intermediate_results'].get('rule_AtLoc_OccDepot_occupied_depots', None)
+                after_mask_logged = log_entry['rule_masks'].get('after_AtLoc_OccDepot', None)
+
+                if is_at_loc_logged is not None:
+                    f.write(f"  当前车辆是否在客户点: {'是' if is_at_loc_logged else '否'}\n")
+                    if is_at_loc_logged: # 只有在客户点时才打印占用信息和结果
+                        if occupied_depots_logged is not None:
+                            # 格式化被占用充电站信息
+                            occupied_list = occupied_depots_logged.int().tolist()
+                            occupied_str = ", ".join([f"充电站{i}:{v}" for i, v in enumerate(occupied_list)])
+                            f.write(f"  被其他车辆占用的充电站 (1=占用, 0=未占用):\n")
+                            f.write(f"    [{occupied_str}]\n")
+                        else:
+                            f.write("  被占用充电站信息: 未记录\n")
+
+                        if after_mask_logged is not None:
+                             f.write(f"  应用此规则后的掩码:\n")
+                             f.write(f"  {format_mask(after_mask_logged, self.num_locs)}\n")
+                        else:
+                             f.write("  应用此规则后的掩码: 未记录\n")
+                    else:
+                        f.write("  (车辆不在客户点，此规则未应用)\n")
+                else:
+                    f.write("  (此规则的日志信息未找到)\n")
+                f.write("\n")
+                # --- 新增结束 ---
+
                 # 规则6: 跳过批次
                 f.write("规则6: 跳过的批次仅允许留在原地\n")
                 f.write(f"  是否跳过: {log_entry['intermediate_results'].get('is_skipped', False)}\n")
