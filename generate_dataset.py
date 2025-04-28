@@ -142,7 +142,7 @@ class CIRPDataset(Dataset):
         vehicle_initial_position_id = torch.randint(num_locs, num_nodes, (num_vehicles, )) # [num_vehicles]
         # vehicle_discharge_rate = torch.FloatTensor([vehicle_discharge_rate for _ in range(num_vehicles)]) #删除
        #vehicle_consump_rate = torch.FloatTensor([0.161 * grid_scale for _ in range(num_vehicles)]) 
-        vehicle_consump_rate = torch.FloatTensor([0.501 * grid_scale for _ in range(num_vehicles)]) 
+        vehicle_consump_rate = torch.FloatTensor([0.301 * grid_scale for _ in range(num_vehicles)]) 
         #-----------
         # locations
         #-----------

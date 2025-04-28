@@ -1681,8 +1681,8 @@ class CIRPState(object):
         if self.fname is not None and hasattr(self, 'mask_calc_log'):
             current_step_log["rule_masks"]["initial"] = mask[batch].clone().detach().cpu()
 
-        # 规则1: 车辆无法返回的节点
-        self.mask_unreturnable_nodes(mask, next_node_id, next_vehicle_mask)
+        # # 规则1: 车辆无法返回的节点
+        # self.mask_unreturnable_nodes(mask, next_node_id, next_vehicle_mask)
 
         # EV cannot discharge power when its battery rearches the limit, so EV should return to a depot at that time.
         # 规则1: 电量达到放电下限时必须返回充电站
@@ -1778,30 +1778,49 @@ class CIRPState(object):
         # 计算电量阈值
         battery_limit = self.low_battery_threshold * current_cap + SMALL_VALUE # 加一点小数防止精度问题
 
-        # 识别哪些批次的当前车辆电量低
-        is_low_battery = current_batt <= battery_limit # [batch_size]
+        # 检查车辆是否未满电
+        is_not_full = current_batt < current_cap - SMALL_VALUE # [batch_size]
 
-        # 如果存在低电量车辆，则应用限制
-        if is_low_battery.any():
+        # 检查车辆电量是否低于阈值
+        is_below_threshold = current_batt <= battery_limit # [batch_size]
+
+        # --- 新增：检查车辆当前是否不在充电站 ---
+        # next_node_id 在 update_mask 上下文中代表车辆当前的位置
+        is_not_currently_at_depot = ~self.is_depot(next_node_id) # [batch_size]
+        # ---------------------------------------
+
+        # --- 修改：组合所有条件 ---
+        # 规则应用条件：未满 & 低于阈值 & 当前不在充电站
+        apply_low_battery_rule_refined = is_not_full & is_below_threshold & is_not_currently_at_depot # [batch_size]
+        # ------------------------
+
+        # 如果存在 *任何一个* 批次需要应用此规则
+        if apply_low_battery_rule_refined.any():
             # 创建一个限制掩码，其中客户点(loc)为0，充电站(depot)为1
             loc_restriction = torch.zeros(self.batch_size, self.num_locs, dtype=mask.dtype, device=self.device)
             depot_allowance = torch.ones(self.batch_size, self.num_depots, dtype=mask.dtype, device=self.device)
             low_battery_restriction_mask = torch.cat((loc_restriction, depot_allowance), dim=1) # [batch_size, num_nodes]
 
-            # 创建一个条件掩码，用于选择性地应用限制
-            # 形状: [batch_size, 1] -> [batch_size, num_nodes]
-            apply_restriction_condition = is_low_battery.unsqueeze(1).expand_as(mask)
+            # 创建条件掩码，用于选择性地应用限制
+            # --- 修改：使用精炼后的条件 ---
+            apply_restriction_condition = apply_low_battery_rule_refined.unsqueeze(1).expand_as(mask)
+            # --------------------------
 
-            # 使用 torch.where 应用限制：如果电量低，则使用限制掩码，否则保持原样
-            # 注意：这里直接使用 low_battery_restriction_mask 会屏蔽掉所有 loc，这是我们想要的
+            # 应用限制：如果满足精炼条件，则使用限制掩码，否则保持原样
             mask = torch.where(apply_restriction_condition, low_battery_restriction_mask, mask)
 
-            # （可选）记录日志
+            # （可选）更新日志以反映新条件
             if current_step_log is not None:
-                current_step_log["intermediate_results"]["low_battery_triggered"] = is_low_battery[batch].item()
-                current_step_log["intermediate_results"]["low_battery_limit"] = battery_limit[batch].item()
-                current_step_log["intermediate_results"]["current_acting_battery"] = current_batt[batch].item()
-                current_step_log["rule_masks"]["after_low_battery"] = mask[batch].clone().detach().cpu()
+                 current_step_log["intermediate_results"]["low_battery_check_is_not_full"] = is_not_full[batch].item()
+                 current_step_log["intermediate_results"]["low_battery_check_is_below_threshold"] = is_below_threshold[batch].item()
+                 # 添加新条件的日志
+                 current_step_log["intermediate_results"]["low_battery_check_is_not_at_depot"] = is_not_currently_at_depot[batch].item()
+                 # 记录最终是否应用规则
+                 current_step_log["intermediate_results"]["low_battery_rule_applied_refined"] = apply_low_battery_rule_refined[batch].item()
+                 current_step_log["intermediate_results"]["low_battery_limit"] = battery_limit[batch].item()
+                 current_step_log["intermediate_results"]["current_acting_battery"] = current_batt[batch].item()
+                 current_step_log["rule_masks"]["after_low_battery"] = mask[batch].clone().detach().cpu()
+        # --- 修改规则结束 ---
         # --- 新增规则结束 ---
 
         # --------------------------------------------------------------------------
@@ -1908,6 +1927,8 @@ class CIRPState(object):
                 current_node_id = next_node_id[batch_idx] # 车辆当前节点ID (Tensor)
                 # 获取当前车辆坐标，确保形状正确 [coord_dim]
                 current_coords = self.coords[batch_idx, current_node_id]
+                                # 判断搁浅车辆电量是否已满
+                is_vehicle_full = self.vehicle_curr_battery[batch_idx, stranded_vehicle_id] >= self.vehicle_cap[batch_idx, stranded_vehicle_id] - SMALL_VALUE
 
                 # 1. 识别可用的充电站 (在此回退逻辑中，我们不考虑 small_depots)
                 depot_ids_global = torch.arange(self.num_locs, self.num_nodes, device=self.device) # 所有充电站的全局ID
@@ -3051,17 +3072,42 @@ class CIRPState(object):
         batch = 0  # 处理第一个批次
         output_dir = f"{self.fname}-sample{batch}"  # 创建输出目录
         os.makedirs(output_dir, exist_ok=True)  # 确保目录存在
+
+
+        # --- 添加健壮性检查 ---
+        if not hasattr(self, 'time_history') or not self.time_history or not self.time_history[batch]:
+            print(f"警告: 在 output_mask_history 中, time_history 为空或未初始化 (batch {batch})。")
+            return
+        if not hasattr(self, 'mask_histories'):
+            print(f"警告: 在 output_mask_history 中, mask_histories 未初始化。")
+            return
+        # --- 检查结束 ---、
+
+        time_points = self.time_history[batch]
+        num_time_steps = len(time_points) # **获取时间历史的长度**
+
+
+        # # 准备数据结构
+        # mask_history_data = {
+        #     "time": self.time_history[batch],     # 时间序列
+        #     "masks": {}                           # 掩码历史数据
+        # }
         
-        # 准备数据结构
         mask_history_data = {
-            "time": self.time_history[batch],     # 时间序列
-            "masks": {}                           # 掩码历史数据
+            "time": time_points,
+            "masks": {}
         }
-        
-        # 2. 收集每个掩码的历史数据
-        # 遍历所有掩码类型，收集其历史数据
+
+        # # 2. 收集每个掩码的历史数据
+        # # 遍历所有掩码类型，收集其历史数据
+        # for mask_name in self.mask_names:
+        #     if len(self.mask_histories[mask_name][batch]) > 0:
+        #         mask_history_data["masks"][mask_name] = self.mask_histories[mask_name][batch]
+
         for mask_name in self.mask_names:
-            if len(self.mask_histories[mask_name][batch]) > 0:
+            if (mask_name in self.mask_histories and
+                    batch < len(self.mask_histories[mask_name]) and
+                    self.mask_histories[mask_name][batch]):
                 mask_history_data["masks"][mask_name] = self.mask_histories[mask_name][batch]
 
         # 3. 保存PKL文件
@@ -3069,73 +3115,109 @@ class CIRPState(object):
         with open(pkl_path, "wb") as f:
             pickle.dump(mask_history_data, f)
         
-        # 生成可读的TXT文件
+        # # 生成可读的TXT文件
+        # txt_path = f"{output_dir}/mask_history_data_readable.txt"
+        # with open(txt_path, "w") as f:
+        #     # 写入时间历史
+        #     f.write("===== Time Points =====\n")
+        #     f.write(f"State points: {[f'state_{i} ({t:.3f})' for i, t in enumerate(self.time_history[batch])]}\n\n")
+            
+        #     # 写入各掩码历史
+        #     f.write("===== Mask History =====\n")
+        #     for mask_name, mask_hist in mask_history_data["masks"].items():
+        #         f.write(f"\n=== {mask_name} ===\n")
+                
+        #         # 根据掩码类型分类处理
+        #         if mask_name in ["vehicle_position_id", "vehicle_phase"]:
+        #             # 车辆相关的多维数据
+        #             for time_idx, values in enumerate(mask_hist):
+        #                 f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}):\n")
+        #                 f.write(f"  Values for each vehicle: {values}\n")
+                
+        #         # 处理布尔型掩码
+        #         elif mask_name in ["loc_is_down", "loc_is_full", "loc_is_normal",
+        #                         "wait_vehicle", "at_depot", "at_loc",
+        #                         "queued_vehicles", "charging_vehicles", "small_depots"]:
+        #             if mask_hist and isinstance(mask_hist[0], torch.Tensor):
+        #                 num_items = mask_hist[0].numel()
+        #                 item_label = ("车辆" if "vehicle" in mask_name or "charge" in mask_name or "queued" in mask_name 
+        #                             else "基站" if "loc" in mask_name 
+        #                             else "充电站" if "depot" in mask_name 
+        #                             else "项目")
+        #                 for time_idx, values_tensor in enumerate(mask_hist):
+        #                     values_list = values_tensor.tolist()
+        #                     f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}):\n")
+        #                     status_str = ", ".join([f"{item_label}{i}={val}" for i, val in enumerate(values_list)])
+        #                     f.write(f"  状态: [{status_str}]\n")
+                            
+        #                     # 添加统计信息
+        #                     if mask_name == "loc_is_down":
+        #                         down_count = sum(1 for x in values_list if x)
+        #                         f.write(f"  总断电基站数: {down_count}\n")
+        #                     elif mask_name == "queued_vehicles":
+        #                         queued_count = sum(1 for x in values_list if x)
+        #                         f.write(f"  总排队车辆数: {queued_count}\n")
+        #                     elif mask_name == "charging_vehicles":
+        #                         charging_count = sum(1 for x in values_list if x)
+        #                         f.write(f"  总充电车辆数: {charging_count}\n")
+            
+        #         elif mask_name in ["charge_queue"]:
+        #             # 充电队列数据
+        #             for time_idx, queue_tensor in enumerate(mask_hist):
+        #                 f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}):\n")
+        #                 queue_list = queue_tensor.tolist()
+        #                 f.write(f"  Queue status (充电站 x 车辆):\n")
+        #                 for depot_idx, depot_queue in enumerate(queue_list):
+        #                     f.write(f"    充电站 {depot_idx}: {depot_queue}\n")
+                
+        #         elif mask_name in ["skip", "end", "next_vehicle_mask"]:
+        #             # 简单布尔值或单值掩码
+        #             for time_idx, value in enumerate(mask_hist):
+        #                 f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}): {value}\n")
+                
+        #         else:
+        #             # 其他掩码类型
+        #             for time_idx, values in enumerate(mask_hist):
+        #                 f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}): {values}\n")
+                
+        #         f.write("\n")
+
+        # --- 生成可读的TXT文件 ---
         txt_path = f"{output_dir}/mask_history_data_readable.txt"
         with open(txt_path, "w") as f:
-            # 写入时间历史
-            f.write("===== Time Points =====\n")
-            f.write(f"State points: {[f'state_{i} ({t:.3f})' for i, t in enumerate(self.time_history[batch])]}\n\n")
-            
-            # 写入各掩码历史
             f.write("===== Mask History =====\n")
+            f.write(f"时间点数量: {num_time_steps}\n\n")
+
             for mask_name, mask_hist in mask_history_data["masks"].items():
                 f.write(f"\n=== {mask_name} ===\n")
-                
-                # 根据掩码类型分类处理
-                if mask_name in ["vehicle_position_id", "vehicle_phase"]:
-                    # 车辆相关的多维数据
-                    for time_idx, values in enumerate(mask_hist):
-                        f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}):\n")
-                        f.write(f"  Values for each vehicle: {values}\n")
-                
-                # 处理布尔型掩码
-                elif mask_name in ["loc_is_down", "loc_is_full", "loc_is_normal",
-                                "wait_vehicle", "at_depot", "at_loc",
-                                "queued_vehicles", "charging_vehicles", "small_depots"]:
-                    if mask_hist and isinstance(mask_hist[0], torch.Tensor):
-                        num_items = mask_hist[0].numel()
-                        item_label = ("车辆" if "vehicle" in mask_name or "charge" in mask_name or "queued" in mask_name 
-                                    else "基站" if "loc" in mask_name 
-                                    else "充电站" if "depot" in mask_name 
-                                    else "项目")
-                        for time_idx, values_tensor in enumerate(mask_hist):
-                            values_list = values_tensor.tolist()
-                            f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}):\n")
-                            status_str = ", ".join([f"{item_label}{i}={val}" for i, val in enumerate(values_list)])
-                            f.write(f"  状态: [{status_str}]\n")
-                            
-                            # 添加统计信息
-                            if mask_name == "loc_is_down":
-                                down_count = sum(1 for x in values_list if x)
-                                f.write(f"  总断电基站数: {down_count}\n")
-                            elif mask_name == "queued_vehicles":
-                                queued_count = sum(1 for x in values_list if x)
-                                f.write(f"  总排队车辆数: {queued_count}\n")
-                            elif mask_name == "charging_vehicles":
-                                charging_count = sum(1 for x in values_list if x)
-                                f.write(f"  总充电车辆数: {charging_count}\n")
-            
-                elif mask_name in ["charge_queue"]:
-                    # 充电队列数据
-                    for time_idx, queue_tensor in enumerate(mask_hist):
-                        f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}):\n")
-                        queue_list = queue_tensor.tolist()
-                        f.write(f"  Queue status (充电站 x 车辆):\n")
-                        for depot_idx, depot_queue in enumerate(queue_list):
-                            f.write(f"    充电站 {depot_idx}: {depot_queue}\n")
-                
-                elif mask_name in ["skip", "end", "next_vehicle_mask"]:
-                    # 简单布尔值或单值掩码
-                    for time_idx, value in enumerate(mask_hist):
-                        f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}): {value}\n")
-                
-                else:
-                    # 其他掩码类型
-                    for time_idx, values in enumerate(mask_hist):
-                        f.write(f"State_{time_idx} ({self.time_history[batch][time_idx]:.3f}): {values}\n")
-                
-                f.write("\n")
-                    
+                num_mask_steps = len(mask_hist)
+
+                # --- 关键修改：使用 num_time_steps 迭代，并检查 mask_hist 长度 ---
+                for time_idx in range(num_time_steps):
+                    # 安全地访问 time_points
+                    current_time = time_points[time_idx]
+
+                    # 检查 mask_hist 是否足够长
+                    if time_idx < num_mask_steps:
+                        values = mask_hist[time_idx]
+                        f.write(f"State_{time_idx} (Time: {current_time:.3f}):\n")
+                        # --- 你原有的格式化 'values' 的代码放在这里 ---
+                        if isinstance(values, torch.Tensor):
+                             f.write(f"  Values: {values.tolist()}\n")
+                        else:
+                             f.write(f"  Values: {values}\n")
+                        # --- 格式化代码结束 ---
+                    else:
+                        # 如果 mask_hist 比 time_history 短，则标记缺失
+                        f.write(f"State_{time_idx} (Time: {current_time:.3f}):\n")
+                        f.write(f"  (警告: 掩码 '{mask_name}' 在此时间点无数据)\n")
+
+                # 如果原始长度不匹配，添加一条整体警告
+                if num_mask_steps != num_time_steps:
+                    f.write(f"  (注意: 掩码 '{mask_name}' 的总步数 ({num_mask_steps}) 与时间步数 ({num_time_steps}) 不匹配)\n")
+
+                f.write("\n") # 每个掩码后加空行
+
 
         # 5. 生成可视化图表
         if SAVE_PICTURE:
@@ -3647,9 +3729,19 @@ class CIRPState(object):
     def output_batt_history(self):
         """输出电池电量、断电基站数量的历史数据到 PKL 和可读 TXT 文件"""
         batch = 0  # 仅处理第一个批次 (因为可视化通常只针对一个样本)
-        if not hasattr(self, 'time_history') or not self.time_history[batch]:
-            print("警告: 历史数据为空，无法输出电池历史。")
+
+        # --- 添加健壮性检查 ---
+        if not hasattr(self, 'time_history') or not self.time_history or not self.time_history[batch]:
+            print(f"警告: 在 output_batt_history 中, time_history 为空或未初始化 (batch {batch})。")
             return
+        if not hasattr(self, 'vehicle_batt_history') or not self.vehicle_batt_history or not self.vehicle_batt_history[batch]:
+            print(f"警告: 在 output_batt_history 中, vehicle_batt_history 为空或未初始化 (batch {batch})。")
+            return
+        # --- 检查结束 ---
+
+        # if not hasattr(self, 'time_history') or not self.time_history[batch]:
+        #     print("警告: 历史数据为空，无法输出电池历史。")
+        #     return
 
         output_dir = f"{self.fname}-sample{batch}"
         os.makedirs(output_dir, exist_ok=True)  # 确保目录存在
@@ -3678,33 +3770,21 @@ class CIRPState(object):
 
                 time_points = history_data.get("time", [])
                 veh_batt_history = history_data.get("veh_batt", [])
-                loc_batt_history = history_data.get("loc_batt", [])
-                down_loc_history = history_data.get("down_loc", [])
+                #loc_batt_history = history_data.get("loc_batt", [])
+                #down_loc_history = history_data.get("down_loc", [])
 
                 # 检查历史记录长度是否一致 (理论上应该一致)
                 num_steps = len(time_points)
-                if not (len(veh_batt_history) == self.num_vehicles and
-                        all(len(hist) == num_steps for hist in veh_batt_history) and
-                        len(loc_batt_history) == self.num_locs and
-                        all(len(hist) == num_steps for hist in loc_batt_history) and
-                        len(down_loc_history) == num_steps):
-                    f.write("错误：历史记录长度不一致，无法完整输出。\n")
-                    print(f"警告: 历史记录长度不一致 (时间点: {num_steps})，TXT 输出可能不完整。")
-                    # 打印长度信息帮助调试
-                    print(f"  车辆电量历史长度: {[len(h) for h in veh_batt_history]}")
-                    print(f"  基站电量历史长度: {[len(h) for h in loc_batt_history]}")
-                    print(f"  断电基站历史长度: {len(down_loc_history)}")
-                    # 截断到最短长度以尝试输出
-                    min_len = num_steps
-                    if veh_batt_history and self.num_vehicles > 0:
-                        min_len = min(min_len, min(len(h) for h in veh_batt_history))
-                    if loc_batt_history and self.num_locs > 0:
-                        min_len = min(min_len, min(len(h) for h in loc_batt_history))
-                    if down_loc_history:
-                        min_len = min(min_len, len(down_loc_history))
-                    num_steps = min_len  # 更新步数以安全迭代
 
-                # 逐个时间步输出状态
+                # --- 简化长度检查 ---
+                min_len = num_steps
+                if veh_batt_history and self.num_vehicles > 0:
+                    min_len = min(min_len, min(len(h) for h in veh_batt_history if h)) # 确保 h 不为空
+                if min_len < num_steps:
+                     print(f"警告: 车辆电量历史长度不一致 (时间点: {num_steps})TXT 输出将截断到 {min_len}。")
+                     num_steps = min_len
+
+
                 for step_idx in range(num_steps):
                     current_t = time_points[step_idx]
                     f.write(f"===== 步骤 {step_idx} (时间: {current_t:.3f} h) =====\n")
@@ -3712,28 +3792,64 @@ class CIRPState(object):
                     # 输出车辆电量
                     f.write("--- 车辆电量 ---\n")
                     if veh_batt_history and self.num_vehicles > 0:
+                         # 安全访问
                         veh_batt_str = ", ".join([f"车辆{i}: {veh_batt_history[i][step_idx]:.2f}"
-                                                for i in range(self.num_vehicles) if step_idx < len(veh_batt_history[i])])
+                                                for i in range(self.num_vehicles) if i < len(veh_batt_history) and step_idx < len(veh_batt_history[i])])
                         f.write(f"  [{veh_batt_str}]\n")
                     else:
                         f.write("  N/A\n")
 
-                    # 输出基站电量
-                    f.write("--- 基站电量 ---\n")
-                    if loc_batt_history and self.num_locs > 0:
-                        loc_batt_str = ", ".join([f"基站{i}: {loc_batt_history[i][step_idx]:.2f}"
-                                                for i in range(self.num_locs) if step_idx < len(loc_batt_history[i])])
-                        f.write(f"  [{loc_batt_str}]\n")
-                    else:
-                        f.write("  N/A\n")
+                # if not (len(veh_batt_history) == self.num_vehicles and
+                #         all(len(hist) == num_steps for hist in veh_batt_history) and
+                #         len(loc_batt_history) == self.num_locs and
+                #         all(len(hist) == num_steps for hist in loc_batt_history) and
+                #         len(down_loc_history) == num_steps):
+                #     f.write("错误：历史记录长度不一致，无法完整输出。\n")
+                #     print(f"警告: 历史记录长度不一致 (时间点: {num_steps})，TXT 输出可能不完整。")
+                #     # 打印长度信息帮助调试
+                #     print(f"  车辆电量历史长度: {[len(h) for h in veh_batt_history]}")
+                #     print(f"  基站电量历史长度: {[len(h) for h in loc_batt_history]}")
+                #     print(f"  断电基站历史长度: {len(down_loc_history)}")
+                #     # 截断到最短长度以尝试输出
+                #     min_len = num_steps
+                #     if veh_batt_history and self.num_vehicles > 0:
+                #         min_len = min(min_len, min(len(h) for h in veh_batt_history))
+                #     if loc_batt_history and self.num_locs > 0:
+                #         min_len = min(min_len, min(len(h) for h in loc_batt_history))
+                #     if down_loc_history:
+                #         min_len = min(min_len, len(down_loc_history))
+                #     num_steps = min_len  # 更新步数以安全迭代
 
-                    # 输出断电基站数量
-                    f.write("--- 断电基站 ---\n")
-                    if down_loc_history and step_idx < len(down_loc_history):
-                        down_count = down_loc_history[step_idx]
-                        f.write(f"  数量: {int(down_count)}\n")  # 确保是整数
-                    else:
-                        f.write("  N/A\n")
+                # # 逐个时间步输出状态
+                # for step_idx in range(num_steps):
+                #     current_t = time_points[step_idx]
+                #     f.write(f"===== 步骤 {step_idx} (时间: {current_t:.3f} h) =====\n")
+
+                #     # 输出车辆电量
+                #     f.write("--- 车辆电量 ---\n")
+                #     if veh_batt_history and self.num_vehicles > 0:
+                #         veh_batt_str = ", ".join([f"车辆{i}: {veh_batt_history[i][step_idx]:.2f}"
+                #                                 for i in range(self.num_vehicles) if step_idx < len(veh_batt_history[i])])
+                #         f.write(f"  [{veh_batt_str}]\n")
+                #     else:
+                #         f.write("  N/A\n")
+
+                    # # 输出基站电量
+                    # f.write("--- 基站电量 ---\n")
+                    # if loc_batt_history and self.num_locs > 0:
+                    #     loc_batt_str = ", ".join([f"基站{i}: {loc_batt_history[i][step_idx]:.2f}"
+                    #                             for i in range(self.num_locs) if step_idx < len(loc_batt_history[i])])
+                    #     f.write(f"  [{loc_batt_str}]\n")
+                    # else:
+                    #     f.write("  N/A\n")
+
+                    # # 输出断电基站数量
+                    # f.write("--- 断电基站 ---\n")
+                    # if down_loc_history and step_idx < len(down_loc_history):
+                    #     down_count = down_loc_history[step_idx]
+                    #     f.write(f"  数量: {int(down_count)}\n")  # 确保是整数
+                    # else:
+                    #     f.write("  N/A\n")
 
                     f.write("\n")  # 每个时间步后加空行
 
@@ -3766,11 +3882,22 @@ class CIRPState(object):
             
             # 确保在绘图前检查历史记录是否存在且不为空
             if self.time_history and self.time_history[batch]:
+
                 # 绘制车辆电量历史
                 for vehicle_id in range(self.num_vehicles):
-                    if vehicle_id < len(self.vehicle_batt_history[batch]) and self.vehicle_batt_history[batch][vehicle_id]:
-                        min_len = min(len(self.time_history[batch]), len(self.vehicle_batt_history[batch][vehicle_id]))
-                        ax1.plot(self.time_history[batch][:min_len], list(self.vehicle_batt_history[batch][vehicle_id][:min_len]))
+                    # --- 安全检查 ---
+                    if (vehicle_id < len(self.vehicle_batt_history[batch]) and
+                        self.vehicle_batt_history[batch][vehicle_id]):
+                        # --- 确保长度一致 ---
+                        current_veh_hist = self.vehicle_batt_history[batch][vehicle_id]
+                        plot_len = min(len(self.time_history[batch]), len(current_veh_hist))
+                        ax1.plot(self.time_history[batch][:plot_len], list(current_veh_hist[:plot_len]), label=f"Vehicle {vehicle_id}") # 添加label
+
+                # 绘制车辆电量历史
+                # for vehicle_id in range(self.num_vehicles):
+                #     if vehicle_id < len(self.vehicle_batt_history[batch]) and self.vehicle_batt_history[batch][vehicle_id]:
+                #         min_len = min(len(self.time_history[batch]), len(self.vehicle_batt_history[batch][vehicle_id]))
+                #         ax1.plot(self.time_history[batch][:min_len], list(self.vehicle_batt_history[batch][vehicle_id][:min_len]))
                 
                 # # 绘制基站电量历史
                 # for loc_id in range(self.num_locs):

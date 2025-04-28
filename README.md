@@ -50,7 +50,7 @@ python valid.py --model_dir checkpoints/demo_model --dataset_path data/synthetic
 
 python valid.py --model_dir checkpoints/demo_model --dataset_path data/synthetic_data/valid_dataset.pkl  --time_horizon 0.5
 
-python valid.py --model_dir checkpoints/demo_model --dataset_path data/synthetic_data/valid_dataset.pkl  --time_horizon 13 --max_epoch 5
+python valid.py --model_dir checkpoints/demo_model --dataset_path data/synthetic_data/valid_dataset.pkl  --time_horizon 13 --max_epoch 0
 
 
 小量化快速测试
