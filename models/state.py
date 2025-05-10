@@ -31,7 +31,6 @@ FPS = 40 # 之后改 清晰度可用就行 #这里改成了 60 -》40
 UNEQUAL_INTERVAL = False # 是否使用不等时间间隔
 COEF = 1.0  # 一般系数，用于调整某些计算的比例
 V_COEF = 1.0   # 车辆相关的系数，用于调整车辆相关的计算
-
 #--------------------------
 # when input is route_list
 #--------------------------
@@ -1682,7 +1681,7 @@ class CIRPState(object):
             current_step_log["rule_masks"]["initial"] = mask[batch].clone().detach().cpu()
 
         # # 规则1: 车辆无法返回的节点
-        # self.mask_unreturnable_nodes(mask, next_node_id, next_vehicle_mask)
+        self.mask_unreturnable_nodes(mask, next_node_id, next_vehicle_mask)
 
         # EV cannot discharge power when its battery rearches the limit, so EV should return to a depot at that time.
         # 规则1: 电量达到放电下限时必须返回充电站
@@ -1966,9 +1965,10 @@ class CIRPState(object):
                     mask[batch_idx, target_depot_global_id] = 1 # 只允许目标充电站
 
                     # 打印引导信息
-                    print(f"信息: 步骤 {self.episode_step}, 时间 {self.current_time[batch_idx]:.3f}, "
-                          f"车辆 {stranded_vehicle_id} (节点 {current_node_id.item()}) "
-                          f"无有效目标，已引导至最近可用充电站 {target_depot_global_id.item()}")
+                    #跑实验暂时关闭
+                    # print(f"信息: 步骤 {self.episode_step}, 时间 {self.current_time[batch_idx]:.3f}, "
+                    #       f"车辆 {stranded_vehicle_id} (节点 {current_node_id.item()}) "
+                    #       f"无有效目标，已引导至最近可用充电站 {target_depot_global_id.item()}")
 
                     # (可选) 更新日志
                     if current_step_log is not None and batch_idx == batch:
@@ -1979,9 +1979,10 @@ class CIRPState(object):
 
                 else:
                     # 没有可用的充电站，执行原始的回退逻辑：允许停留在原地
-                    print(f"警告: 步骤 {self.episode_step}, 时间 {self.current_time[batch_idx]:.3f}, "
-                          f"车辆 {stranded_vehicle_id} (节点 {current_node_id.item()}) "
-                          f"没有有效目标节点，且无可用充电站，将允许留在原地。")
+                    #跑实验暂时关闭
+                    #  print(f"警告: 步骤 {self.episode_step}, 时间 {self.current_time[batch_idx]:.3f}, "
+                    #       f"车辆 {stranded_vehicle_id} (节点 {current_node_id.item()}) "
+                    #       f"没有有效目标节点，且无可用充电站，将允许留在原地。")
                     mask[batch_idx] = 0 # 先全部置零
                     mask[batch_idx, current_node_id] = 1 # 允许留在原地
 

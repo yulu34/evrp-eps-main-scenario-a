@@ -228,7 +228,7 @@ if __name__ == "__main__":
     #------------------
     parser.add_argument("--random_seed",    type=int, default=1234)
     parser.add_argument("--gpu",            type=int, default=-1)
-    parser.add_argument("--num_workers",    type=int, default=8) # 4-》8
+    parser.add_argument("--num_workers",    type=int, default=4) # 4-》8
     parser.add_argument("--checkpoint_dir", type=str, default=f"checkpoints/model_{now.strftime('%Y%m%d_%H%M%S')}")
     parser.add_argument("--debug",          action="store_true")
 
